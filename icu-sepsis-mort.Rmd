@@ -1,0 +1,100 @@
+---
+title: "Predicting Sepsis Mortality"
+author: "C.V. Cosgriff"
+output: html_notebook
+---
+
+## Environment Setup
+```{r warning = FALSE, message = FALSE}
+library(tidyverse)
+library(broom)
+library(lubridate)
+library(stringr)
+library(RPostgreSQL)
+library(MIMICbook) #JRaffa's MIMIC code book
+library(epitools) # For calculating OR's
+library(tableone) # Generating Table 1
+library(sjstats) # Some useful stats tools e.g. hoslem_gof
+library(sjPlot)
+
+# These libs are for logistic regression diagnostics
+library(rms)
+library(quantreg)
+library(pROC)
+library(separationplot)
+library(heatmapFit)
+# End of logistic libs
+
+# GBM
+library(xgboost)
+
+library(rstudioapi)
+library(dslabs) # Dr. Irrizary's library 
+
+ds_theme_set() # Dr. Irrizary's theme
+
+# Database access; you'll need to change 10.8.0.1 to the server you are using
+# and you will also need to run ths in RStudio as I use the RStudio API to ask
+# for a password. Edit this definition for your environment as need.
+drv <- dbDriver("PostgreSQL")
+mimic <- dbConnect(drv, dbname = "mimic", host = "10.8.0.1", port = 5432,
+                   user = "mimicuser", 
+                   password = askForPassword("MIMIC Password: "))
+```
+
+## Background Information
+
+## Data Pull
+
+The data for building the model will be taken from the first day in the ICU. 
+The tables used for these pulls were generated using SQL code provided by the
+MIT Laboratory of Computational, and were predominately written by A.E. Johnson.
+
+The code can be found [here](https://github.com/MIT-LCP/mimic-code/tree/master/concepts/firstday).
+
+### Sepsis Patients by Angus criteria
+
+```{r}
+base_cohort <- dbGetQuery(mimic, "SELECT * FROM mimiciii.angus_sepsis;") %>%
+  filter(angus == 1) %>% select(subject_id, hadm_id)
+```
+
+### Arterial ABG
+  
+```{r}
+abg_first <- dbGetQuery(mimic, "SELECT * FROM mimiciii.bloodgasfirstdayarterial;")
+```
+
+
+### GCS
+### Vitals
+### Urine output
+### RRT
+### Ventilated
+### Height/Weight (to get BMI)
+### Labs
+### Elixhauser (ahrq_no_drg_all_icd)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
