@@ -16,7 +16,8 @@ library(epitools) # For calculating OR's
 library(tableone) # Generating Table 1
 library(sjstats) # Some useful stats tools e.g. hoslem_gof
 library(sjPlot)
-
+library(Hmisc)
+library(reshape2)
 # These libs are for logistic regression diagnostics
 library(rms)
 library(quantreg)
@@ -25,6 +26,14 @@ library(separationplot)
 library(heatmapFit)
 # End of logistic libs
 
+# ML
+library(caret)
+library(mlr)
+library(parallel)
+library(parallelMap)
+
+parallelStartSocket(cpus = detectCores())
+
 # GBM
 library(xgboost)
 
@@ -32,14 +41,6 @@ library(rstudioapi)
 library(dslabs) # Dr. Irrizary's library 
 
 ds_theme_set() # Dr. Irrizary's theme
-
-# Database access; you'll need to change 10.8.0.1 to the server you are using
-# and you will also need to run ths in RStudio as I use the RStudio API to ask
-# for a password. Edit this definition for your environment as need.
-drv <- dbDriver("PostgreSQL")
-mimic <- dbConnect(drv, dbname = "mimic", host = "10.8.0.1", port = 5432,
-                   user = "mimicuser", 
-                   password = askForPassword("MIMIC Password: "))
 ```
 
 ## Background Information
@@ -55,25 +56,376 @@ The code can be found [here](https://github.com/MIT-LCP/mimic-code/tree/master/c
 ### Sepsis Patients by Angus criteria
 
 ```{r}
-base_cohort <- dbGetQuery(mimic, "SELECT * FROM mimiciii.angus_sepsis;") %>%
-  filter(angus == 1) %>% select(subject_id, hadm_id)
+angus <- read_csv("./data/angus_sepsis.csv") %>% 
+  select(subject_id, hadm_id, angus)
 ```
 
 ### Arterial ABG
   
 ```{r}
-abg_first <- dbGetQuery(mimic, "SELECT * FROM mimiciii.bloodgasfirstdayarterial;")
+abg_first <- read_csv("./data/abg.csv") %>% select(subject_id, hadm_id, 
+                                                   icustay_id, charttime, po2, 
+                                                   pco2, ph)
 ```
 
 
 ### GCS
+
+```{r}
+gcs <- read_csv("./data/gcs.csv") %>% select(subject_id, hadm_id, icustay_id, mingcs)
+```
+
 ### Vitals
+
+```{r}
+vitals <- read_csv("./data/vitals.csv") %>% 
+  select(-glucose_mean, -glucose_min, -glucose_max)
+```
+
 ### Urine output
+
+```{r}
+uo <- read_csv("./data/uo.csv")
+```
+
 ### RRT
+
+```{r}
+rrt <- read_csv("./data/rrt.csv")
+```
+
 ### Ventilated
+
+```{r}
+vent <- read_csv("./data/ventfirst.csv")
+```
+
+
 ### Height/Weight (to get BMI)
+
+```{r}
+hw <- read_csv("./data/hw.csv") %>% select(subject_id, icustay_id, weight_first, height_first)
+```
+
+
 ### Labs
+
+```{r}
+labs <- read_csv("./data/labs.csv")
+```
+
 ### Elixhauser (ahrq_no_drg_all_icd)
+
+```{r}
+elix <- read_csv("./data/elixhauser.csv") %>% 
+  mutate(score = rowSums(.[,3:32])) %>%
+  select(hadm_id, elixhauser = score)
+  
+```
+
+### ICU Stay &  Detail Table
+
+```{r}
+detail <- read_csv("./data/icustay_detail.csv") %>% 
+  select(icustay_id, hadm_id, subject_id, hadm_id, age, gender, los_icu)
+expire <- read_csv("./data/icu_expire.csv") %>% 
+  select(icustay_id, icustay_expire_flag)
+```
+
+
+## Building the Dataset
+
+```{r}
+cohort <- inner_join(angus, detail, by = c("hadm_id", "subject_id")) %>% 
+  inner_join(expire, by = c("icustay_id")) %>%
+  inner_join(vitals, by = c("icustay_id", "hadm_id", "subject_id")) %>%
+  inner_join(gcs, by = c("icustay_id", "hadm_id", "subject_id")) %>%
+  inner_join(labs, by = c("icustay_id", "hadm_id", "subject_id")) %>%
+  inner_join(uo, by = c("icustay_id", "hadm_id", "subject_id")) %>%
+  inner_join(rrt, by = c("icustay_id", "hadm_id", "subject_id")) %>%
+  inner_join(vent, by = c("icustay_id", "hadm_id", "subject_id")) %>%
+  inner_join(elix, by = c("hadm_id")) %>% 
+  filter(angus == 1, los_icu > 0.167, age > 16 ) %>%
+  select(-angus, -subject_id, -hadm_id, -los_icu) %>%
+  select(icustay_id, icustay_expire_flag, everything())
+```
+
+We are going to build a gradient boosted tree model using XGBoost. As such, we
+need to convert the predictors to numeric. Almost all are except for gender, 
+which we can code as 1 or male and 0 for female.
+
+```{r}
+cohort$gender <- as.numeric(cohort$gender == "M")
+```
+
+## Initial Check of the Data
+```{r}
+glimpse(cohort)
+```
+
+We don't want to exclude missing data en masse, especially since gbm can handle
+missing values. Instead, we want to exclude values which are clinically 
+impossible. This is not to say incompatible with life (e.g. BP = 0), which we
+would expect for the very ill and would not want to exclude, but rather values
+that appear to be entry errors of sorts.
+
+```{r}
+summary(cohort)
+```
+
+From this we can make the following observations:
+- There are ages of 300; this is expected as anyone with an age >89 must be stored
+  as a non-real number for privacy purposes. The MIMIC-III guidelines say to shift
+  any ages with these values to 91.4, the median for patients above 89 in the
+  dataset.
+
+```{r}
+cohort$age[cohort$age > 89] <- 91.4
+```
+
+- Heart rate min, mean, and max are all clinically possible values
+- The blood pressure values are all clinically possible.
+- The respiratory rates are all clinically possible
+- The temperatures are all clinically possible (e.g. severe hypothermia)
+- The saturation values are reasonable
+- The lab values appear to be possible in most cases. For example the very low
+  sodium values can be seen with intracranial masses, potassium levels can get
+  very high or low from diuretic use, and etc.
+- Specifically some of the WBC look very high, but perusal of the top patient's
+  records show they stayed at this level, and thus likely had a leukemia.
+- The high platelet counts can also be encountered in processes like essential
+  thrombocytosis
+- Urine output appears to have a negative number which is impossible:
+
+```{r}
+cohort %>% select(urineoutput) %>% arrange(urineoutput)
+```
+
+There are 5 below 0; these numbers can either be zeroed or the patients can be 
+removed. As there are ~15k patients, it is less biased to toss the patients then
+to plug in a value. 
+
+```{r}
+cohort <- cohort %>% filter(urineoutput > 0)
+```
+
+Overall, there are bound to be data entry errors in this data, but I am more 
+comfortable letting them stay then manually removing data. In addition, outliers
+can't really be removed in a non-biased way because being a physiologic outlier
+exists in the ICU and is important to consider.
+
+## Exploratory Data Analysis
+
+Before fitting models, we will begin by exploring our data.
+
+1. How many patients died?
+
+```{r}
+mean(cohort$icustay_expire_flag)
+table(cohort$icustay_expire_flag)
+```
+
+2. Does death vary by gender?
+
+```{r}
+cohort %>% group_by(gender) %>% summarise(prop_died = mean(icustay_expire_flag))
+```
+
+The proportion dead appears approximately equal by gender.
+
+3. How do the variables vary by outcome?
+
+```{r}
+cohort %>% group_by(icustay_expire_flag) %>% na.omit %>% 
+  select (-icustay_id, -gender) %>% 
+  summarise_all(funs(mean))
+```
+
+As expected, patients who die appear "sicker" in most parameters.
+
+4. What do the distributions of these variables look like?
+
+```{r fig.height=15, fig.width=15}
+cohort_melt <- melt(cohort %>% select(-gender, -icustay_expire_flag), id.vars = "icustay_id")
+ggplot(cohort_melt) + geom_histogram(aes(x = value)) + facet_wrap(~variable, scales = "free")
+```
+
+Many of the physiological parameters appear normally distributed; paramters like
+SpO2 and BUN skew towards normal however. GCS skews toward normal. Elixhauser
+is normal appearing suggesting a wide spectrum of comorbidity centered around
+patients with a moderate burden of disease.
+
+
+5. Clearly many of the variables are significantly correlated with eachother... 
+
+I'd like to see these results graphically, but there are way to many correlations
+with p < 0.05. As such, we'll use a cutoff of 0.001 for the p-value, and |r| > 0.7.
+ 
+```{r}
+correlations <- rcorr(as.matrix(cohort[3:68]))
+m <- 65
+for (i in 1:m) {
+  for (j in 1:m) {
+    if (!is.na(correlations$P[i,j])) {
+      if (correlations$P[i,j] < 0.001 & abs(correlations$r[i,j]) > 0.7) {
+        xparam <- str_split(rownames(correlations$P)[i], "_")[[1]][1]
+        yparam <- str_split(rownames(correlations$P)[j], "_")[[1]][1]
+        if (!identical(xparam, yparam)) {
+          p <- ggplot(cohort) + 
+            geom_point(aes(x = get(rownames(correlations$P)[i]), y = get(colnames(correlations$P)[j]))) +
+            xlab(rownames(correlations$P)[i]) + ylab(colnames(correlations$P)[j]) +
+            geom_smooth(aes(x = get(rownames(correlations$P)[i]), y = get(colnames(correlations$P)[j])), method = c("lm"))
+          print(p)
+        }
+      }
+    }
+  }
+}
+```
+
+From these view it becomes obvious that the variables popping out as correlated
+are all values we would expect to be closely related. For example mean arterial
+pressure is a function of systolic and diastolic BP and so they are all correalted.
+
+In addition sodium and chloride and always in balance. The results we see for
+PT vs INR are interesting since they are of course related, but we note two 
+seperate populations on the scatter plot likely hinting at a group with different
+coagulation dyanmics.
+
+6. What are the univariate associations between variables and outcome?
+
+```{r}
+for (i in colnames(cohort %>% select(-icustay_id, -icustay_expire_flag))) {
+  with(cohort, print(paste(i, t.test(get(i) ~ as.factor(icustay_expire_flag))$p.value < 0.05)))
+}
+```
+
+Virtually all the variables are significantly associated with death in the ICU
+at a 0.05 significance level.
+
+Exceptions: gender, meanbp_max, chloride_max, glucose_min, hematocrit_max, 
+hemoglobin_max, and sodium_max
+
+## Modeling
+
+First, lets make a training set.
+```{r}
+set.seed(23)
+indices <- createDataPartition(y = cohort$icustay_expire_flag, p = 0.8)$Resample
+
+train <- cohort %>% dplyr::slice(indices)
+test <- cohort %>% dplyr::slice(-indices)
+```
+
+These data need to be converted to matrices in order to be used with xgboost.
+
+```{r}
+train_label <- train$icustay_expire_flag
+test_label <- test$icustay_expire_flag
+
+train_mat <- as.matrix(train[,3:68])
+test_mat <- as.matrix(test[,3:68])
+
+train_xgmat <- xgb.DMatrix(data = train_mat, label = train_label)
+test_xgmat <- xgb.DMatrix(data = test_mat, label = test_label)
+```
+
+
+Since we have no other non-numeric variables, we can proceed. We begin by 
+setting the default parameters.
+
+```{r}
+params <- list(booster = "gbtree", objective = "binary:logistic", 
+               eta = 0.3, gamma = 0, max_depth = 6, min_child_weight = 1, 
+               subsample = 1, colsample_bytree = 1)
+```
+
+And now we can use CV to determine the ideal number of iterations. We'll use 20
+fold cross validation.
+
+```{r}
+nround_cv <- xgb.cv(params = params, data = train_xgmat, nrounds = 100, 
+                    nfold = 20, showsd = T, stratified = T, print_every_n = 10, 
+                    early_stopping_rounds = 50, maximize = F, metrics = "error")
+```
+
+And now we can fit the first model.
+
+```{r}
+mort_gbm1 <- xgb.train(params = params, data = train_xgmat, nrounds = 39, 
+                       watchlist = list(val=test_xgmat, train = train_xgmat), 
+                       print_every_n = 10, early_stopping_rounds = 50, 
+                       maximize = F, eval_metric = "error")
+```
+
+And then we can evaluate it.
+
+```{r}
+pred <- predict(mort_gbm1, test_xgmat)
+
+# Because pred is probability, we will use a cutoff of 0.5 and convert these to 
+# actual predicted outcomes. 
+pred <- ifelse(pred > 0.5, 1, 0)
+
+confusionMatrix(pred, test_label)
+```
+
+This first model has a high accuracy, but evaluation of the operating characteristics
+suggests that its quite sensitive, but poorly specific, and one would suspect this
+has to do with the fact that many more patients lived than died.
+
+We can examine the importance matrix.
+
+```{r fig.height=5, fig.width=5}
+imp_mat <- xgb.importance(feature_names = colnames(train_mat), model = mort_gbm1)
+xgb.ggplot.importance(imp_mat)
+```
+
+The most important aspects of survival are all markers of organ dysfunction. For
+example, urine output is a marker of renal failure, sysbp_min corresponds to
+shock, spo2_mean corresponds to how well the patient is oxygenating, and 
+resprate_mean is a key vital sign in evaluating pulmonary function. Both lactate
+min and max are important; this makes sense here as lactate is a markers of 
+anaerobic respiration, and suggests tissue ischemia.
+
+We can now further tune the model. To do this we'll perform a random search using
+MLR. We'll build 100 models.
+
+```{r}
+traintask <- makeClassifTask (data = train, target = "icustay_expire_flag")
+testtask <- makeClassifTask (data = test, target = "icustay_expire_flag")
+
+xgb_lrn <- makeLearner("classif.xgboost", predict.type = "response")
+xgb_lrn$par.vals <- list(objective = "binary:logistic", eval_metric = "error", nrounds = 100L, eta = 0.1)
+
+params <- makeParamSet(makeDiscreteParam("booster", values = c("gbtree", "gblinear")), 
+                       makeIntegerParam("max_depth", lower = 3L, upper = 10L), 
+                       makeNumericParam("min_child_weight", lower = 1L, upper = 10L), 
+                       makeNumericParam("subsample",lower = 0.5, upper = 1), 
+                       makeNumericParam("colsample_bytree", lower = 0.5, upper = 1))
+
+resamp <- makeResampleDesc("CV", stratify = T, iters = 20L)
+tune_control <- makeTuneControlRandom(maxit = 100)
+
+tune <- tuneParams(learner = xgb_lrn, task = traintask, resampling = resamp, 
+                   measures = acc, par.set = params, control = tune_control, 
+                   show.info = T)
+```
+
+Now we can fit our model with these parameters.
+
+```{r}
+tuned_lrn <- setHyperPars(xgb_lrn, par.vals = tune$x)
+mort_gbm2 <- mlr::train(learner = tuned_lrn, task = traintask)
+pred <- predict(mort_gbm2, testtask)
+confusionMatrix(pred$data$response, pred$data$truth)
+```
+
+
+
+
+
+
 
 
 
