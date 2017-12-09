@@ -4,197 +4,397 @@ author: "C.V. Cosgriff"
 output: html_notebook
 ---
 
-## Environment Setup
-```{r warning = FALSE, message = FALSE}
+```{r warning = FALSE, message = FALSE, echo = FALSE}
 library(tidyverse)
 library(broom)
+library(ggfortify) # For enhancing autoplot for PCA
 library(lubridate)
 library(stringr)
 library(RPostgreSQL)
 library(MIMICbook) #JRaffa's MIMIC code book
-library(epitools) # For calculating OR's
-library(tableone) # Generating Table 1
 library(sjstats) # Some useful stats tools e.g. hoslem_gof
 library(sjPlot)
 library(Hmisc)
-library(reshape2)
-# These libs are for logistic regression diagnostics
-library(rms)
-library(quantreg)
-library(pROC)
-library(separationplot)
-library(heatmapFit)
-# End of logistic libs
+library(reshape2) # Useful for Melt
 
 # ML
 library(caret)
 library(mlr)
 library(parallel)
 library(parallelMap)
-
+library(xgboost)
 parallelStartSocket(cpus = detectCores())
 
-# GBM
-library(xgboost)
-
 library(rstudioapi)
-library(dslabs) # Dr. Irrizary's library 
+library(dslabs)
 
 ds_theme_set() # Dr. Irrizary's theme
 ```
 
-## Background Information
+## Overview and Motivation
+Sepsis is a systemic inflammatory response to infection. The terminology of 
+sepsis is confusing as most modern criterion for sepsis include organ dysfunction,
+but a 1992 consensus defined "severe sepsis" as sepsis complicated by acute
+organ dysfunction; "severe sepsis" and sepsis are often used interchangably. [Angus, 2013]
 
-## Data Pull
+In the hospital, patients used to often managed for sepsis based on "SIRS Criteria."
+SIRS, referring to systemic inflammatory response syndrome was defined by 
+physiologic abnormalities: temperature >98C, heart rate >90, respiratory rate
+that is >20 or arterial CO2 <32mmHg, and an elevated white count above 12,000/mm^3.
+With this criteria, sepsis was defined as SIRS + a source. This means that a culture
+proven infection in the context of SIRS defined a patient as having sepsis. 
 
-The data for building the model will be taken from the first day in the ICU. 
-The tables used for these pulls were generated using SQL code provided by the
-MIT Laboratory of Computational, and were predominately written by A.E. Johnson.
+More recently, new criteria have been proposed. The sequential organ failure
+assessment (SOFA) was proposed and adopted as a prognostication tool for patients in 
+the ICU with a focus on sepsis, but requires substantial invasive measurement.
+A short form of SOFA, quick SOFA (qSOFA), asks three questions similar to SIRS
+in order to identify patients who would benefit from a higher level of care.
+It is worth mentioning that SOFA used to mean "sepsis-related organ failure 
+assessment" rather than "sequeqntial organ failure assessment" in the literature.
+The latest definition is known as SEPSIS-3, which was developed at the Third 
+International Consensus for Sepsis and Septic Shock.
 
-The code can be found [here](https://github.com/MIT-LCP/mimic-code/tree/master/concepts/firstday).
+The murkiness of the definition around sepsis has challenged epidemiological
+measurement, but researchers such as Angus have attempted to measure the 
+incidence of sepsis using ICD-9 codes that account for infection and organ
+dysfunction. [Angus, 2001]
 
-### Sepsis Patients by Angus criteria
+In his 2001 paper the found an incidence of 3.0 cases per 1,000 people
+and 2.26 cases per 100 hospital discharges in 1995. They found a mortality of
+28.6% although other studies quote in-hospital sepsis mortality rates at ~50%. [UpToDate]
 
-```{r}
+Regardless, sepsis is a serious disease process, and the use of clinical and
+laboratory criteria for prognostication remains a challenging problem. The
+Acute Physiology, Age, and Chronic Health Evaluation (APACHE) system  has been
+popular, with the latest version known as APACHE IV achieving an AUROC of 0.88
+per the original paper. SIRS, qSOFA, and SOFA  achieved AUROC's of 0.589, 0.607,
+and 0.753 for in-hospital mortality in patients primarily hospitalized for an
+infectious disease process. [Raith, 2017]
+
+Many of these older models are defined based on clinical expertise and consensus
+meetings, and predictive scores have often been derived using logistic regression.
+As the previously sited AUROCs suggest, they all leave room for improvement. The
+goal of this work is to apply modern machine learning techniques to physiologic
+parameters derived from cinical and laboratory data in an effort to build a better
+mortality predictor. 
+
+To accomplish this, the MIMIC-III database was used to develop a cohort of patients
+identified as having sepsis. Sepsis was defined using the ICD-9 codes developed
+by Angus to account for infectious processes and organ dysfunction. The outcome,
+as in the paper from Raith et al. above, was hospital expiration.
+
+Clinical and laboatory data on the first day of the ICU admission were then 
+extracted. After review of the data for errors, an exploratory data analysis was 
+undertaken to understand if these data drawn only on the first day would be 
+associated with the outcome of hospital expiration in order to guide the 
+selection of a predictor set. From their an initial an initial gradient boosted
+tree model was built using the default parameters described in the XGBoost
+manual and an iteration count derived from 5-fold cross validation. This initial
+model was then tuned in a grid search to select the best parameters. The model
+was then evaluated and sensitivity analysis was perforomed, and the final model
+is presented for further validation on other data sources.
+
+## Related Work
+
+The application of machine learning techniques to the ICU is increasingly
+popular, and work similar to this was performed using data from obtained from
+APACHE IV systems between 2007 and 2011 by Alistair Johnson while he was at
+Oxford. The goal of that work was develop a score that required less variables 
+than APACHE IV, and accuracy in mortality prediction was a secondary aim, and 
+from it the Oxford Acute Severity of Illness Score (OASIS) score was developed.
+
+
+## Initial Questions
+1. What clinical and laboratory variables are associated with hospital mortality?
+2. What is the relationship between these variables? Are some of them redundant?
+   Are there any patterns in the recordings that suggest structure to the data
+   and define groups of patients?
+3. Can a subset of these data be used to build a predictive model of hospital
+   mortality?
+
+## Questions that Arose During the Project
+
+## Data
+
+The MIMIC-III (Medical Information Mart for Intensive Care) database, a publicly
+available database maintained by the MIT Laboratory for Computational Physiology
+that contains health care data on 53,423 distinct hospital admissions at
+Beth Israel Deaconess Medical Center, was used at the primary data source. [Johnson et al., 2016]
+
+Alistair Johnson, mentioned above in the development of OASIS, is now at the
+MIT Laboratory of Computational Physiology. In addition to his instrumental work
+in developing MIMIC-III, he has also developed open source code for extracting
+various clinical and laboratory paramters from the first day of a patients stay
+in the ICU from MIMIC-III. His colleague, Tom Pollard, also at the MIT Laboratory
+for Computational Physiology has developed open source code for selecting sepsis
+patients from MIMIC-III by various criteria including the Angus criteria 
+mentioned above. 
+
+The code can be found [here](https://github.com/MIT-LCP/mimic-code/tree/master/concepts/).
+
+These SQL scripts were used to generate the following materialized views:
+
+1) Angus: a table flagging each admission as meeting Angus "criteria"" for sepsis
+   using the ICD-9 codes for infection and organ failure he published in 2001, 
+   and which have been externally validated.
+2) Vitals first day: a view of the min, max, and mean, of important vital 
+   sign recordings on the first day in the ICU. These include systolic, diastolic,
+   and mean artieral pressures (MAP), heart rate, respiratory rate, arterial
+   hemoglobin saturation by pulse oximetry, and etc.
+3) GCS first day: a table of the patient's glasgow coma score on admission to
+   the ICU.
+4) Laboratory first day: a view of the first day lab results for commonly ordered 
+   labs for each patient. These include electrolytes (sodium, potassium, 
+   chloride, bicarbonate), glucose,white count, number of bands (immature WBC), 
+   hemoglobin, hematcrit, lactate, coagulation measures (PT, PTT, INR), and etc.
+5) Arterial blood gas (ABG) first day: ABG, a special type of lab in which
+   blood is drawn from an artery instead of vein, is used to derive accurate
+   measures for oxygen and carbon dioxide levels in the blood, as well as lactate.
+   ABG data is crucial in evaluating a pateints acid-base status, and the values
+   obtained are significantly more informing than venous gas results or data
+   obtained from pulse oximetry. 
+6) Urine output first day: Urine output is a marker of fluid status and renal 
+   function, both of which are, a priori, highly associated with the level of 
+   illness and risk of death.
+7) Renal replacement therapy (RRT) first day: RRT or dialysis as it is more
+   commonly known, is used in patients with severe renal failure and other
+   critical illness contexts in which the kidney's cannot adequately remove
+   waste products, particularly those associated with protein degradation, 
+   nitrogenous waste, and uremia, from the blood. The use of RRT on the first
+   day in the ICU should be highly associated with a patient's illness burden.
+8) Ventilation first day: ventilation is provided to patients in a variety of
+   critical clinical contexts such as loss of respiratory drive, airway obstruction
+   secondary to process such as asthma or chronic obstructive pulmonary disorder
+   exacerbation, and inability of the patient to protect their airway. As such,
+   the use of ventilation on the first day should be associated with prognosis.
+9) Elixhauser: the Elixhauser score is a system derived using diagnosis codes
+   to estimate the burden of comorbidity a patient has. It is derived in MIMIC-III
+   using avilable diagnosis codes.
+10) ICU stay detail: a view that contains demographic data about patients for
+    each ICU stay, as well as whether or not they died in the hospital
+    (hospital_expire_flag).
+
+There is also the table of diagnoses by ICD-9 codes which was not used for 
+model building but was examined briefly during exploratory data anlysis. The 
+associated concept for ICD-9 codes (d_icd_diagnoses) was used to annotate these
+as needed.
+
+Because the evaluators of this work will not have access to my local server
+environment, the above views were generated and then exported from PostgreSQL
+as CSV files. They will be loaded in now. Of note, some data are available in
+multiple places; e.g. glucose is present in both vitals and labs, lactate is 
+present a single recording for the blood gas data whereas ranges for it are
+extracted in the laboratory pull. Variables will only be included once, and
+concepts like glucose and lactate which are best summarized in the labs table
+will be drawn from there instead of other souces. Also of note, unlike the other
+first day tables, which are summary recordings for all first day data, the ABG
+view contains all recorded ABGs for a patient as seperate observations. Because
+we want a measure predictor of disease severity it may seem obvious to take
+the so-called "worst" value. However, making this decision can introduce 
+significant bias as pO2 and pCO2 are parameters which we would expect to be 
+associated with illness status parabolically. That is to say, a very high pCO2
+may indicate respiratory collapse, but a very low pCO2 will signify tachypnea
+which may be secondary to a variety of contexts of varying criticality. As such,
+a measure of central tendency will be applied. We would expect pCO2 to be 
+fairly normally distributed as very low and very high values are associated with
+severe acid-base distrubances which are highly associated with death. pO2 however
+is less likely to obey this, and because of metabolic adaptations we should
+expect skew in all parameters. As such, the first recorded gas by chart time will
+be used. This is expected to introduce less bias as only non-differental
+information bias is potentially introduced.
+
+Lastly, some patients have many admissions to the ICU, and the consensus at
+the MIT Laboratory for Computatonal Physiology is that building models off 
+ICU stays after the first one can be misleading as a patient is already fairly
+"run down" after a single ICU course. As such, mortality predictions will be 
+based off the first stay only.
+
+
+### ICU Stay and Angus Criteria
+```{r, message = FALSE, warning = FALSE}
+detail <- read_csv("./data/icustay_detail.csv") %>% 
+  select(icustay_id, hadm_id, subject_id, hadm_id, age, gender, ethnicity, los_icu, 
+         intime, hospital_expire_flag) %>% 
+  arrange(intime) %>% 
+  distinct(hadm_id, .keep_all = TRUE)
 angus <- read_csv("./data/angus_sepsis.csv") %>% 
   select(subject_id, hadm_id, angus)
 ```
 
-### Arterial ABG
-  
-```{r}
-abg_first <- read_csv("./data/abg.csv") %>% select(subject_id, hadm_id, 
-                                                   icustay_id, charttime, po2, 
-                                                   pco2, ph)
-```
-
-
-### GCS
-
-```{r}
-gcs <- read_csv("./data/gcs.csv") %>% select(subject_id, hadm_id, icustay_id, mingcs)
-```
-
-### Vitals
-
-```{r}
+### Vital Signs
+```{r, message = FALSE, warning = FALSE}
 vitals <- read_csv("./data/vitals.csv") %>% 
   select(-glucose_mean, -glucose_min, -glucose_max)
 ```
 
-### Urine output
-
-```{r}
+### Fluid Status and Kidney Function
+```{r, message = FALSE, warning = FALSE}
+rrt <- read_csv("./data/rrt.csv")
 uo <- read_csv("./data/uo.csv")
 ```
 
-### RRT
 
-```{r}
-rrt <- read_csv("./data/rrt.csv")
-```
-
-### Ventilated
-
-```{r}
+### Ventilation Status
+```{r, message = FALSE, warning = FALSE}
 vent <- read_csv("./data/ventfirst.csv")
 ```
 
-
-### Height/Weight (to get BMI)
-
-```{r}
-hw <- read_csv("./data/hw.csv") %>% select(subject_id, icustay_id, weight_first, height_first)
-```
-
-
-### Labs
-
-```{r}
+### Laboratory Values
+```{r, message = FALSE, warning = FALSE}
 labs <- read_csv("./data/labs.csv")
+abg_first <- read_csv("./data/abg.csv") %>% 
+  select(icustay_id, po2, pco2, ph, charttime) %>%
+  arrange(charttime) %>% 
+  distinct(icustay_id, .keep_all = TRUE) %>% select(-charttime)
 ```
 
-### Elixhauser (ahrq_no_drg_all_icd)
-
-```{r}
+### Mental Status and Comorbidity Burden
+```{r, message = FALSE, warning = FALSE}
+gcs <- read_csv("./data/gcs.csv") %>% select(subject_id, hadm_id, icustay_id, 
+                                             mingcs)
+# Note: Elixhauster is a set of discrete categories for which a point is given;
+# and the sum is the score.
 elix <- read_csv("./data/elixhauser.csv") %>% 
-  mutate(score = rowSums(.[,3:32])) %>%
+  mutate(score = rowSums(.[,3:32])) %>% 
   select(hadm_id, elixhauser = score)
-  
 ```
 
-### ICU Stay &  Detail Table
+### Formation of the Cohort Dataset
+To build a cohort, we'll begin by combining the angus and detail tables. This
+will done as an inner join: patients without an Angus status of 0 or 1 will
+not be included. From this base cohort, we'll pull in all of the data we loaded
+above. Because we only kept the first ICU stay ID for each admission, a subject
+should only appear twice if they have been re-admitted. It is fine for a two
+admissions to appear, and we make the assumption that they represent distinct
+events leading to ICU admission although this may not hold in a small subset
+of the patients. We also make the assumption that previous admission data
+are uncorrelated with current admission data. This is not necessarily true, but
+mirror's real life, and since this tool would be used per admission it seems 
+reasonable to include both admissions as long as we use the first ICU stay's 
+data per admission.
 
-```{r}
-detail <- read_csv("./data/icustay_detail.csv") %>% 
-  select(icustay_id, hadm_id, subject_id, hadm_id, age, gender, los_icu)
-expire <- read_csv("./data/icu_expire.csv") %>% 
-  select(icustay_id, icustay_expire_flag)
-```
-
-
-## Building the Dataset
+We then apply the following exclusion criteria:
+1) Age <16; our predictions are targeting adults only
+2) LOS >4 hours (0.167 days); this excludes patients admitted to the ICU by mistake or for
+   non-critical illness such as post-operatively.
+3) We only keep those with angus equal to 1, as we only want to examine patients
+   with sepsis by the Angus ICD-9 codes.
 
 ```{r}
 cohort <- inner_join(angus, detail, by = c("hadm_id", "subject_id")) %>% 
-  inner_join(expire, by = c("icustay_id")) %>%
-  inner_join(vitals, by = c("icustay_id", "hadm_id", "subject_id")) %>%
-  inner_join(gcs, by = c("icustay_id", "hadm_id", "subject_id")) %>%
-  inner_join(labs, by = c("icustay_id", "hadm_id", "subject_id")) %>%
-  inner_join(uo, by = c("icustay_id", "hadm_id", "subject_id")) %>%
-  inner_join(rrt, by = c("icustay_id", "hadm_id", "subject_id")) %>%
-  inner_join(vent, by = c("icustay_id", "hadm_id", "subject_id")) %>%
-  inner_join(elix, by = c("hadm_id")) %>% 
+  left_join(vitals, by = c("icustay_id", "hadm_id", "subject_id")) %>%
+  left_join(gcs, by = c("icustay_id", "hadm_id", "subject_id")) %>%
+  left_join(labs, by = c("icustay_id", "hadm_id", "subject_id")) %>%
+  left_join(abg_first, by = c("icustay_id")) %>%
+  left_join(uo, by = c("icustay_id", "hadm_id", "subject_id")) %>%
+  left_join(rrt, by = c("icustay_id", "hadm_id", "subject_id")) %>%
+  left_join(vent, by = c("icustay_id", "hadm_id", "subject_id")) %>%
+  left_join(elix, by = c("hadm_id")) %>% 
   filter(angus == 1, los_icu > 0.167, age > 16 ) %>%
-  select(-angus, -subject_id, -hadm_id, -los_icu) %>%
-  select(icustay_id, icustay_expire_flag, everything())
+  select(-angus, -icustay_id, -intime, -los_icu) %>%
+  select(subject_id, hadm_id, hospital_expire_flag, everything())
 ```
 
-We are going to build a gradient boosted tree model using XGBoost. As such, we
-need to convert the predictors to numeric. Almost all are except for gender, 
-which we can code as 1 or male and 0 for female.
+To confirm that our joins worked as expected, there should a cohort in which
+a single subject can appear twice, but there is only one ICU admission per 
+admission to the hospital, and a patient should obviously only die once. 
+
+We can examine the first two quite simply; for expiration, we are performing
+a "sanity check." Because the flag is 0 or 1, and because there can be multiple 
+admissions per subject, the sum of the flag should be 0 or 1, but never more.
+We will use this idea to check if anyone has been coded as dying twice.
 
 ```{r}
-cohort$gender <- as.numeric(cohort$gender == "M")
+# First two checks
+cohort %>% group_by(subject_id) %>% summarise(count = n()) %>% arrange(-count)
+cohort %>% group_by(hadm_id) %>% summarise(count = n()) %>% arrange(-count)
+
+# Expiration sanity check
+cohort %>% group_by(subject_id) %>% summarise(expiration_sanity_check = sum(hospital_expire_flag)) %>% arrange(-expiration_sanity_check)
 ```
 
-## Initial Check of the Data
+All of the checks suggest our dataset is okay. We no longer need subject_id's
+as a subject can be present twice, but rather the admission ID (hadm_id), since
+this is a model for predicting mortality on admission.
+
+Ultimately, we build a gradient boosted tree model using XGBoost. As such, we
+need to convert the predictors to numeric. Almost all are except for gender, 
+which we can code as 1 or male and 0 for female. We also need to recode 
+ethncity to make it less granular, and the dummy code the variables. Lastly,
+we are bound to have some ages in the cohort which are ~300. This is because
+HIPPA regulations require the actual age of patients of >89 years old to be
+hidden since, given the small size of this population, there is a risk of data
+leakage. The MIMIC-III guidelines say to shift any ages with these values to 91.4, 
+the median for patients above 89 in the dataset.
+
+```{r}
+cohort <- cohort %>% mutate(male_gender = as.numeric(cohort$gender == "M")) %>%
+  select(-gender)
+
+ethnicities <- c("WHITE", "BLACK", "HISPANIC", "ASIAN")
+for (i in 1:length(ethnicities)) {
+  cohort$ethnicity[str_detect(cohort$ethnicity, ethnicities[i])] <- ethnicities[i]
+}
+cohort$ethnicity[!(cohort$ethnicity %in% ethnicities)] <- "OTHER"
+cohort <- cohort %>% mutate(white_eth = ifelse(ethnicity == "WHITE", 1, 0),
+                            black_eth = ifelse(ethnicity == "BLACK", 1, 0),
+                            hispanic_eth = ifelse(ethnicity == "HISPANIC", 1, 0),
+                            asian_eth = ifelse(ethnicity == "ASIAN", 1, 0),
+                            other_eth = ifelse(ethnicity == "OTHER", 1, 0)) %>%
+  select(-subject_id, -ethnicity) %>%
+  select(hadm_id, hospital_expire_flag, male_gender, white_eth, black_eth,
+         hispanic_eth, asian_eth, other_eth, vent, rrt, elixhauser, mingcs, age,
+         everything())
+
+# Note that I used the select statement above to reorder the data. I've grouped
+# variables together to the left of the continuous variables which are together.
+# This is useful when you want to use subsetting and only want to look at certian
+# variable types.
+
+cohort$age[cohort$age > 89] <- 91.4
+```
+
 ```{r}
 glimpse(cohort)
 ```
 
-We don't want to exclude missing data en masse, especially since gbm can handle
-missing values. Instead, we want to exclude values which are clinically 
-impossible. This is not to say incompatible with life (e.g. BP = 0), which we
-would expect for the very ill and would not want to exclude, but rather values
-that appear to be entry errors of sorts.
+We don't want to exclude missing data en masse: lots of specifc tests, e.g. 
+bands which traditionally need to requested on a complete blood count (CBC), 
+will be missing. In additin, gradient boosting can technically handle missing 
+data in tree construction
+
+However, we do want to exclude values which are clinically impossible. This is 
+not to say incompatible with life (e.g. BP = 0), which would certainly expect
+in the critically ill at times. The key point here being that the tails of 
+distributions for many of these parameters are real and clinically relevant and
+simple exclusion of outliers by say Tukey's rule will only bias our results. So,
+we will carefully apply clinical knowledge to these data with a very conversative
+approach to discarding data (only excluding things we are certain could not be
+real). We will also examine how the missing data are distributed by variable to
+discern whether such variables should be excluded from model buidling procedures.
 
 ```{r}
 summary(cohort)
 ```
 
 From this we can make the following observations:
-- There are ages of 300; this is expected as anyone with an age >89 must be stored
-  as a non-real number for privacy purposes. The MIMIC-III guidelines say to shift
-  any ages with these values to 91.4, the median for patients above 89 in the
-  dataset.
 
-```{r}
-cohort$age[cohort$age > 89] <- 91.4
-```
-
-- Heart rate min, mean, and max are all clinically possible values
+- Heart rate min, mean, and max are all clinically possible values.
 - The blood pressure values are all clinically possible.
-- The respiratory rates are all clinically possible
-- The temperatures are all clinically possible (e.g. severe hypothermia)
-- The saturation values are reasonable
+- The respiratory rates are all clinically possible.
+- The temperatures are all clinically possible (e.g. severe hypothermia).
+- The saturation values are reasonable as they are constrained by 0 and 100.
 - The lab values appear to be possible in most cases. For example the very low
   sodium values can be seen with intracranial masses, potassium levels can get
   very high or low from diuretic use, and etc.
 - Specifically some of the WBC look very high, but perusal of the top patient's
   records show they stayed at this level, and thus likely had a leukemia.
+- The bilirubin values that appear extreme can occur in processes which obstruct
+  the biliary tree such as pancreatic adenocarcinoma, or in processes which
+  result in liver damaga such acute/chonic hepatitis or cirrhosis.
 - The high platelet counts can also be encountered in processes like essential
-  thrombocytosis
+  thrombocytosis. Very low counts can be see in consumptive processes such as
+  thrombotic thrombocytopenic purpura.
 - Urine output appears to have a negative number which is impossible:
 
 ```{r}
@@ -202,72 +402,222 @@ cohort %>% select(urineoutput) %>% arrange(urineoutput)
 ```
 
 There are 5 below 0; these numbers can either be zeroed or the patients can be 
-removed. As there are ~15k patients, it is less biased to toss the patients then
+removed. As there are ~15k admissions, it is less biased to toss the patients then
 to plug in a value. 
 
 ```{r}
 cohort <- cohort %>% filter(urineoutput > 0)
 ```
 
+- There are some very high lactate values, but even personally I've see extreme
+  lactate values in the ICU during shock recussitations and events such as
+  bowel infarction.
+
+- The bloog gas values, too, are clinically reasonable. pO2 can get unresonably
+  high in real life when FiO2 is set very high, and pCO2 appears constrained to
+  reasonable values. pH is contrained from 6.4 (very acidic) to 7.8 (very basic),
+  but both can occur during shock states or poisonings as respective examples.
+
 Overall, there are bound to be data entry errors in this data, but I am more 
-comfortable letting them stay then manually removing data. In addition, outliers
-can't really be removed in a non-biased way because being a physiologic outlier
-exists in the ICU and is important to consider.
+comfortable with non-differential information bias that hurts model fitting
+than picking and choosing what stays and introducing a selection bias.
 
-## Exploratory Data Analysis
+With this basic review of the dataset complete, with most data kept given the
+clinically possibility of occuring, we are now ready to explore the data.
 
-Before fitting models, we will begin by exploring our data.
+## Exploratory Data Analysis (EDA)
 
-1. How many patients died?
+We will begin EDA by asking for simple questions of our data that get to the
+underlying ideas expressed in our `Initial Questions` section.
 
-```{r}
-mean(cohort$icustay_expire_flag)
-table(cohort$icustay_expire_flag)
-```
-
-2. Does death vary by gender?
+### 1) What proportion of patients died?
 
 ```{r}
-cohort %>% group_by(gender) %>% summarise(prop_died = mean(icustay_expire_flag))
+mean(cohort$hospital_expire_flag)
 ```
 
-The proportion dead appears approximately equal by gender.
-
-3. How do the variables vary by outcome?
+### 2. Does death vary by demography?
 
 ```{r}
-cohort %>% group_by(icustay_expire_flag) %>% na.omit %>% 
-  select (-icustay_id, -gender) %>% 
-  summarise_all(funs(mean))
+cohort %>% group_by(male_gender) %>% summarise(prop_died = mean(hospital_expire_flag)) %>%
+  ggplot() + geom_col(aes(x = as.factor(male_gender), y = prop_died))
 ```
 
-As expected, patients who die appear "sicker" in most parameters.
+There is only a slight gender difference, contrary to many other disease processes
+which often have gender differentials.
 
-4. What do the distributions of these variables look like?
+```{r}
+cohort %>% group_by(white_eth) %>% summarise(prop_died = mean(hospital_expire_flag)) %>%
+  ggplot() + geom_col(aes(x = as.factor(white_eth), y = prop_died))
+
+```
+
+Still though, it appears men died slightly less in this cohort.
+
+```{r}
+cohort %>% group_by(black_eth) %>% summarise(prop_died = mean(hospital_expire_flag)) %>%
+  ggplot() + geom_col(aes(x = as.factor(black_eth), y = prop_died))
+```
+
+Compared to all other ethnicities, those identifying as black had a lower 
+proprtion of death.
+
+```{r}
+cohort %>% group_by(hispanic_eth) %>% summarise(prop_died = mean(hospital_expire_flag)) %>%
+  ggplot() + geom_col(aes(x = as.factor(hispanic_eth), y = prop_died))
+```
+
+Compared to all other ethnicities, those identifying as Hispanic had a lower 
+proprtion of death.
+
+
+```{r}
+cohort %>% group_by(asian_eth) %>% summarise(prop_died = mean(hospital_expire_flag)) %>%
+  ggplot() + geom_col(aes(x = as.factor(asian_eth), y = prop_died))
+```
+
+Asians had a slightly lower proportion than non-Asians.
+
+```{r}
+cohort %>% group_by(other_eth) %>% summarise(prop_died = mean(hospital_expire_flag)) %>%
+  ggplot() + geom_col(aes(x = as.factor(other_eth), y = prop_died))
+```
+
+The binned group "OTHER", which contains those with "unknown" and number of other
+ethncities that were input into MIMIC-III has a larger proprtion of death than
+those identifying as other races.
+
+*There are certainly differences by ethnicity.*
+
+For age we'll examine the proprtion of death by quntile of age.
+
+```{r}
+groups <- 5
+age_quantile <- with(cohort, cut(age, 
+                                breaks = quantile(age, 
+                                                  probs = seq(0,1, by = (1/groups)), 
+                                                  na.rm=TRUE), 
+                                include.lowest = TRUE))
+
+cohort %>% mutate(age_group = age_quantile) %>% group_by(age_group) %>%
+  summarise(prop_died = mean(hospital_expire_flag)) %>%
+  ggplot() + geom_point(aes(x = age_group, y = prop_died))
+```
+
+There appears to be a linear relationship between age group and proportion dying,
+as we would expect. We can repeat this graph and split by gender to see if we
+would expect an interaction.
+
+```{r}
+cohort %>% mutate(age_group = age_quantile) %>% group_by(age_group, male_gender) %>%
+  summarise(prop_died = mean(hospital_expire_flag)) %>%
+  ggplot() + geom_point(aes(x = age_group, y = prop_died, color = as.factor(male_gender)))
+```
+
+The linear relationship holds, and the lines look fairly parallel suggesting
+interaction is likely not present and doesn't need to be explored.
+
+
+### 3. How are the variables associated with outcome?
+
+Before we get specifically to the association between the variables and outcome,
+lets see what the distribution of the continuous variables looks like.
 
 ```{r fig.height=15, fig.width=15}
-cohort_melt <- melt(cohort %>% select(-gender, -icustay_expire_flag), id.vars = "icustay_id")
-ggplot(cohort_melt) + geom_histogram(aes(x = value)) + facet_wrap(~variable, scales = "free")
+melt(cohort %>% select(-hospital_expire_flag, -male_gender, -white_eth, 
+                       -black_eth, -hispanic_eth, -asian_eth, -other_eth, -vent, -rrt), 
+     id.vars = "hadm_id") %>%
+  ggplot() + geom_histogram(aes(x = value)) + facet_wrap(~variable, scales = "free")
 ```
 
-Many of the physiological parameters appear normally distributed; paramters like
-SpO2 and BUN skew towards normal however. GCS skews toward normal. Elixhauser
-is normal appearing suggesting a wide spectrum of comorbidity centered around
-patients with a moderate burden of disease.
 
+This figure has a lot going on, but allows us to quickly scan for the appearance
+of normality and skew. As we would expect, many parameters, such as heart rate,
+which are clinically normal on either side of the mean, appear normally 
+distributed. Parameters for which only one side of the mean is considered
+normal, such as BUN, appear quite skewed.
 
-5. Clearly many of the variables are significantly correlated with eachother... 
+Regardless, we can use tests of association that assume normality. In most cases
+it will be appropriate because of the shape of the distribution, but where it 
+is not, we can justify such tests by the number of patients in our cohort in
+reliance of the central limit theorem (CLT).
 
-I'd like to see these results graphically, but there are way to many correlations
-with p < 0.05. As such, we'll use a cutoff of 0.001 for the p-value, and |r| > 0.7.
- 
+We'll now perform univarate tests of association for the continuous variables.
+
 ```{r}
-correlations <- rcorr(as.matrix(cohort[3:68]))
-m <- 65
+cont_var <- colnames(cohort %>% select(-hadm_id, -hospital_expire_flag, -male_gender, -white_eth, -black_eth, 
+                                        -hispanic_eth, -asian_eth, -other_eth, 
+                                        -vent, -rrt))
+uv_result <- data.frame()
+for (i in cont_var) {
+  uv_result <- rbind(uv_result, 
+                     data.frame(var = i, p = with(cohort, t.test(get(i) ~ as.factor(hospital_expire_flag))$p.value)))
+}
+```
+
+With each association calculated, we can see which variables were signicantly
+associated at an alpha cutoff of <0.05.
+
+```{r}
+uv_result %>% filter(p < 0.05)
+```
+
+59 of the 66 continuous variables are associated with hospital death.
+
+```{r}
+uv_result %>% filter(p > 0.05)
+```
+
+These 7 variables above are not.
+
+We can carry out the same procedure for the binary variables using Fisher's
+exact test.
+
+```{r}
+bin_var <- colnames(cohort %>% select(male_gender, white_eth, -black_eth, 
+                                        hispanic_eth, asian_eth, other_eth, 
+                                        vent, rrt))
+uv_result <- data.frame()
+for (i in bin_var) {
+  uv_result <- rbind(uv_result, 
+                     data.frame(var = i, p = with(cohort, fisher.test(table(get(i), as.factor(hospital_expire_flag)))$p.value)))
+}
+```
+
+And now we can ask which are significant at a 0.05 cut off.
+
+```{r}
+uv_result %>% filter(p < 0.05)
+```
+
+```{r}
+uv_result %>% filter(p > 0.05)
+```
+
+As we can see, vent and rrt are associated, and some, but not all of the race
+categories are associated. Male gender was not associated.
+
+
+
+
+### 4. Is there an underlying structure to the data?
+
+We can start by simply asking, are there any significant correlations? We can
+automate this search with a loop (adapted from StackOverflow). We'll use a p-value
+cutoff of 0.5 for signifance, and only look for "strong" relationships where
+|r| > 0.7. We'll also view the output of our scan as a plot, asking ggplot2
+to fit a regression line for all of the associations that meet criteria.
+
+Note: we'll use some simple string detection to try and avoid things that are 
+obviously correlated like heartrate_max and heartrate_mean.
+
+```{r}
+correlations <- rcorr(as.matrix(cohort[, cont_var]))
+m <- length(cont_var)
 for (i in 1:m) {
   for (j in 1:m) {
     if (!is.na(correlations$P[i,j])) {
-      if (correlations$P[i,j] < 0.001 & abs(correlations$r[i,j]) > 0.7) {
+      if (correlations$P[i,j] < 0.05 & abs(correlations$r[i,j]) > 0.7) {
         xparam <- str_split(rownames(correlations$P)[i], "_")[[1]][1]
         yparam <- str_split(rownames(correlations$P)[j], "_")[[1]][1]
         if (!identical(xparam, yparam)) {
@@ -283,35 +633,112 @@ for (i in 1:m) {
 }
 ```
 
-From these view it becomes obvious that the variables popping out as correlated
-are all values we would expect to be closely related. For example mean arterial
-pressure is a function of systolic and diastolic BP and so they are all correalted.
+The only strong significant associations are between variables which are, by
+definition or nature, linked: 
+1) Systolic and diastolic pressure define MAP
+2) Sodium and chloride are intrinsically linked as a cation-anion pair and stay
+   in balance.
+3) Hemoglobin is a measure of the concentration of hemoglobin in the blood, and
+   hematocrit is the fraction of the blood volume which is red blood cells. As
+   such, they are intrinsically linked by definition.
+4) PT and PTT test the two main pathways in the coagulation cascade (extrinsic,
+   and intrinsic), and INR is a normalized version of PT done at each laboratory
+   in order to control for the susceptibility of PT to chemical factors in each
+   laboratory. Thus INR and PT are intrinsically linked by definition. 
+   
+With respect to point 4, we do note two seperate lines on the graphs for PT and 
+INR. Because of the way INR is derived, this is likely capturing a change that
+occurred in the laboratory standard, and doesn't warrant further exploration.
 
-In addition sodium and chloride and always in balance. The results we see for
-PT vs INR are interesting since they are of course related, but we note two 
-seperate populations on the scatter plot likely hinting at a group with different
-coagulation dyanmics.
-
-6. What are the univariate associations between variables and outcome?
+Now lets perform a principle component analysis.
 
 ```{r}
-for (i in colnames(cohort %>% select(-icustay_id, -icustay_expire_flag))) {
-  with(cohort, print(paste(i, t.test(get(i) ~ as.factor(icustay_expire_flag))$p.value < 0.05)))
-}
+cohort_mat <- as.matrix(cohort[,3:76])
+cohort_mat[is.na(cohort_mat)] <- 0 # An unfortunate requirement of PCA
+cohort_pca <- prcomp(cohort_mat, center = TRUE, scale = TRUE)
 ```
 
-Virtually all the variables are significantly associated with death in the ICU
-at a 0.05 significance level.
+```{r}
+autoplot(cohort_pca, x = 1, y = 2)
+autoplot(cohort_pca, x = 3, y = 4)
+```
 
-Exceptions: gender, meanbp_max, chloride_max, glucose_min, hematocrit_max, 
-hemoglobin_max, and sodium_max
+Looking at the first 4 PCs we see that while there appears to be some group
+separation, the groups that separate off are quite small. As this PCA was 
+performed to explore the data and not to specifically improve model buidling,
+and since the discriminatory effect appears minimal, this approach won't be
+developed further at this time.
 
-## Modeling
+In our EDA we've learned the following:
+1) Demographic factors seem to matter for hospital mortality.
+2) Most of the variables are univariately associated with the outcome.
+3) There does not appear to be a significant amount of correlation between
+   variables past the obvious associations discussed.
+4) The first few PC's obtained from PCA do not very clearly separate the 
+   populations, although future work could attempt to identify what the
+   little off-shoots are.
+
+With respect to point 2), some non-significant variables are worth excluding, 
+but not all of them. Chloride_min and max can go; they're not associated
+and chloride_mean will remain. However, mean_bp_max, glucose_min, sodium_min,
+and sodium_max all seem clinically important, and will be kept at least until
+their lack of importance has been demonstrated in the GBM importance matrix. In
+addition, Elixhauser, while not predicting death, is expected to be important
+in stratifying patients because it is the comorbidity burden, and should be 
+kept for examination in the model. Gender did not seem important, but we can
+also let this be examined in the model, and since some of the race dummy vars
+were significant, we'll keep them all. 
+
+```{r}
+cohort <- cohort %>% select(-chloride_min, -chloride_max)
+```
+
+With respect to point 3) we should remove variables that are
+"redundant" by nature of deinition. As such, we'll keep MAP dropping diastolic
+and systolic pressures, INR dropping PT, and hemoglobin dropping hematocrit.
+
+```{r}
+cohort <- cohort %>% select(-diasbp_min, -diasbp_max, -diasbp_mean, -sysbp_min,
+                            -sysbp_max, -sysbp_mean, -pt_min, -pt_max, 
+                            -hematocrit_min, -hematocrit_max)
+```
+
+
+Finally, before we move onto building our model, lets revist the amount of NA
+present in our data and see if it is worth not using a varaible that has 
+substantial missing data, and could thus do more harm to model fitting than
+good.
+
+```{r}
+sapply(cohort, function(x) sum(is.na(x)))
+```
+
+While some of the blood gas associated values are missing for a litle under a
+third of the cohort, the major issues are bands, albumin, and bilirubin. Clinically,
+bands are an excellent indicator of an infectious process, but they will probably
+not help us much in our modeling, especially in a cohort with infection required
+as an inclusion criteria. Furthermore, bilirubin and albumin have clinical utility,
+but are not routinely collected on initial admission unless the history of 
+present illness suggest their necessity, and thus they can also be removed.
+
+```{r}
+cohort <- cohort %>% select(-bands_min, -bands_max, -bilirubin_min, 
+                            -bilirubin_max, -albumin_min, -albumin_max)
+```
+
+We'll keep the ABG associated tests, despite them missing for so many, because
+ABG's tell us so much about acid-base physiology which is important in all
+medicine, and especially critical care. That said, if they are not found to be
+important to the GBM, we will remove them.
+
+With that, we are ready to move onto model building.
+
+## Final Analysis
 
 First, lets make a training set.
 ```{r}
 set.seed(23)
-indices <- createDataPartition(y = cohort$icustay_expire_flag, p = 0.8)$Resample
+indices <- createDataPartition(y = cohort$hospital_expire_flag, p = 0.8)$Resample
 
 train <- cohort %>% dplyr::slice(indices)
 test <- cohort %>% dplyr::slice(-indices)
@@ -320,76 +747,66 @@ test <- cohort %>% dplyr::slice(-indices)
 These data need to be converted to matrices in order to be used with xgboost.
 
 ```{r}
-train_label <- train$icustay_expire_flag
-test_label <- test$icustay_expire_flag
+train_label <- train$hospital_expire_flag
+test_label <- test$hospital_expire_flag
 
-train_mat <- as.matrix(train[,3:68])
-test_mat <- as.matrix(test[,3:68])
+train_mat <- as.matrix(train[,3:58])
+test_mat <- as.matrix(test[,3:58])
 
 train_xgmat <- xgb.DMatrix(data = train_mat, label = train_label)
 test_xgmat <- xgb.DMatrix(data = test_mat, label = test_label)
 ```
 
 
-Since we have no other non-numeric variables, we can proceed. We begin by 
-setting the default parameters.
+We begin by setting starting paramters. These starting points were chosen based
+on prior work and reading.
 
 ```{r}
 params <- list(booster = "gbtree", objective = "binary:logistic", 
-               eta = 0.3, gamma = 0, max_depth = 6, min_child_weight = 1, 
-               subsample = 1, colsample_bytree = 1)
+               eta = 0.15, gamma = 0, max_depth = 15, min_child_weight = 1, 
+               subsample = 0.5, colsample_bytree = 0.5, seed = 23, nthread = 4)
 ```
 
-And now we can use CV to determine the ideal number of iterations. We'll use 20
+And now we can use CV to determine the ideal number of iterations. We'll use 5
 fold cross validation.
 
 ```{r}
 nround_cv <- xgb.cv(params = params, data = train_xgmat, nrounds = 100, 
-                    nfold = 20, showsd = T, stratified = T, print_every_n = 10, 
-                    early_stopping_rounds = 50, maximize = F, metrics = "error")
+                    nfold = 5, showsd = T, stratified = T, print_every_n = 10, 
+                    early_stopping_rounds = 50, maximize = T, metrics = "auc")
 ```
 
-And now we can fit the first model.
+In addition to obtaining the right number of iterations, we also see something
+quite important here: the training AUC and testing AUC are quite different, and
+our model may be overfit overfit when we train it. We will not include a gamma
+to regularlize for this first model, but will certainly have to examine gamma
+during model tuning.
 
 ```{r}
-mort_gbm1 <- xgb.train(params = params, data = train_xgmat, nrounds = 39, 
-                       watchlist = list(val=test_xgmat, train = train_xgmat), 
+mort_gbm1 <- xgb.train(params = params, data = train_xgmat, 
+                       nrounds = nround_cv$best_iteration, 
+                       watchlist = list(train = train_xgmat), 
                        print_every_n = 10, early_stopping_rounds = 50, 
-                       maximize = F, eval_metric = "error")
+                       maximize = T, eval_metric = "auc")
 ```
 
-And then we can evaluate it.
+We now evaluate this first model.
+
 
 ```{r}
 pred <- predict(mort_gbm1, test_xgmat)
-
 # Because pred is probability, we will use a cutoff of 0.5 and convert these to 
 # actual predicted outcomes. 
 pred <- ifelse(pred > 0.5, 1, 0)
 
-confusionMatrix(pred, test_label)
+confusionMatrix(pred, test_label, positive = "1")
 ```
 
-This first model has a high accuracy, but evaluation of the operating characteristics
-suggests that its quite sensitive, but poorly specific, and one would suspect this
-has to do with the fact that many more patients lived than died.
-
-We can examine the importance matrix.
-
-```{r fig.height=5, fig.width=5}
-imp_mat <- xgb.importance(feature_names = colnames(train_mat), model = mort_gbm1)
-xgb.ggplot.importance(imp_mat)
-```
-
-The most important aspects of survival are all markers of organ dysfunction. For
-example, urine output is a marker of renal failure, sysbp_min corresponds to
-shock, spo2_mean corresponds to how well the patient is oxygenating, and 
-resprate_mean is a key vital sign in evaluating pulmonary function. Both lactate
-min and max are important; this makes sense here as lactate is a markers of 
-anaerobic respiration, and suggests tissue ischemia.
-
-We can now further tune the model. To do this we'll perform a random search using
-MLR. We'll build 100 models.
+This first model is rather specific, but poorly sensitive. This follows logically
+given the prevalence of death in the cohort. However, we saw tha the training
+AUC was quite good; we can introduce regularization to help with this issue. 
+As such, we'll tune the model for all parameters including gamma. To do this we'll 
+perform a grid search using the MLR interface.
 
 ```{r}
 traintask <- makeClassifTask (data = train, target = "icustay_expire_flag")
@@ -418,20 +835,16 @@ Now we can fit our model with these parameters.
 tuned_lrn <- setHyperPars(xgb_lrn, par.vals = tune$x)
 mort_gbm2 <- mlr::train(learner = tuned_lrn, task = traintask)
 pred <- predict(mort_gbm2, testtask)
-confusionMatrix(pred$data$response, pred$data$truth)
+confusionMatrix(pred$data$response, pred$data$truth, positive = "1")
 ```
 
 
 
-
-
-
-
-
-
-
-
-
+# for later
+```{r fig.height=5, fig.width=5}
+imp_mat <- xgb.importance(feature_names = colnames(train_mat), model = mort_gbm1)
+xgb.ggplot.importance(imp_mat)
+```
 
 
 
