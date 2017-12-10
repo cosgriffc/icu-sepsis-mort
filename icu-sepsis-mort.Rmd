@@ -10,24 +10,17 @@ library(broom)
 library(ggfortify) # For enhancing autoplot for PCA
 library(lubridate)
 library(stringr)
-library(RPostgreSQL)
-library(MIMICbook) #JRaffa's MIMIC code book
-library(sjstats) # Some useful stats tools e.g. hoslem_gof
-library(sjPlot)
-library(Hmisc)
 library(reshape2) # Useful for Melt
+library(Hmisc) # overwrites dplyr::summarize but not dplyr::summarise
 
 # ML
 library(caret)
+library(xgboost)
 library(mlr)
 library(parallel)
 library(parallelMap)
-library(xgboost)
-parallelStartSocket(cpus = detectCores())
 
-library(rstudioapi)
 library(dslabs)
-
 ds_theme_set() # Dr. Irrizary's theme
 ```
 
@@ -764,7 +757,7 @@ on prior work and reading.
 ```{r}
 params <- list(booster = "gbtree", objective = "binary:logistic", 
                eta = 0.15, gamma = 0, max_depth = 15, min_child_weight = 1, 
-               subsample = 0.5, colsample_bytree = 0.5, seed = 23, nthread = 4)
+               subsample = 0.5, colsample_bytree = 0.5, seed = 23)
 ```
 
 And now we can use CV to determine the ideal number of iterations. We'll use 5
@@ -803,30 +796,36 @@ confusionMatrix(pred, test_label, positive = "1")
 ```
 
 This first model is rather specific, but poorly sensitive. This follows logically
-given the prevalence of death in the cohort. However, we saw tha the training
+given the prevalence of death in the cohort. However, we saw that the training
 AUC was quite good; we can introduce regularization to help with this issue. 
-As such, we'll tune the model for all parameters including gamma. To do this we'll 
-perform a grid search using the MLR interface.
+
+Now we'll perform a grid search through the parameter space. The ranges for the
+search were chosen after consulting the XGBoost manual and forums for typical
+values.
 
 ```{r}
-traintask <- makeClassifTask (data = train, target = "icustay_expire_flag")
-testtask <- makeClassifTask (data = test, target = "icustay_expire_flag")
+parallelStartSocket(cpus = detectCores())
+traintask <- makeClassifTask (data = train, target = "hospital_expire_flag")
+testtask <- makeClassifTask (data = test, target = "hospital_expire_flag")
 
 xgb_lrn <- makeLearner("classif.xgboost", predict.type = "response")
-xgb_lrn$par.vals <- list(objective = "binary:logistic", eval_metric = "error", nrounds = 100L, eta = 0.1)
+xgb_lrn$par.vals <- list(booster = "gbtree", objective = "binary:logistic", 
+                         nrounds = 100L, eval_metric = "auc", nthread = detectCores())
 
-params <- makeParamSet(makeDiscreteParam("booster", values = c("gbtree", "gblinear")), 
-                       makeIntegerParam("max_depth", lower = 3L, upper = 10L), 
-                       makeNumericParam("min_child_weight", lower = 1L, upper = 10L), 
-                       makeNumericParam("subsample",lower = 0.5, upper = 1), 
-                       makeNumericParam("colsample_bytree", lower = 0.5, upper = 1))
+params <- makeParamSet(makeDiscreteParam("max_depth", values = 5:20),
+                       makeDiscreteParam("gamma", values = 1:10),
+                       makeDiscreteParam("min_child_weight", values = 1:10),
+                       makeDiscreteParam("eta", values = seq(0.01, 0.30, .01)),
+                       makeDiscreteParam("subsample", values = seq(0.1, 0.5, .1)), 
+                       makeDiscreteParam("colsample_bytree", values = seq(0.1, 0.5, .1)))
 
-resamp <- makeResampleDesc("CV", stratify = T, iters = 20L)
-tune_control <- makeTuneControlRandom(maxit = 100)
+resamp <- makeResampleDesc("CV", stratify = T, iters = 5L)
+tune_control <- makeTuneControlGrid()
 
 tune <- tuneParams(learner = xgb_lrn, task = traintask, resampling = resamp, 
                    measures = acc, par.set = params, control = tune_control, 
                    show.info = T)
+parallelStop()
 ```
 
 Now we can fit our model with these parameters.
