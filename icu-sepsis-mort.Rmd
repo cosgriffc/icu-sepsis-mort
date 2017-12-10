@@ -16,10 +16,9 @@ library(Hmisc) # overwrites dplyr::summarize but not dplyr::summarise
 # ML
 library(caret)
 library(xgboost)
-library(mlr)
 library(parallel)
 library(parallelMap)
-
+library(mlr)
 library(dslabs)
 ds_theme_set() # Dr. Irrizary's theme
 ```
@@ -805,19 +804,20 @@ values.
 
 ```{r}
 parallelStartSocket(cpus = detectCores())
+parallelLibrary("mlr")
 traintask <- makeClassifTask (data = train, target = "hospital_expire_flag")
 testtask <- makeClassifTask (data = test, target = "hospital_expire_flag")
 
 xgb_lrn <- makeLearner("classif.xgboost", predict.type = "response")
 xgb_lrn$par.vals <- list(booster = "gbtree", objective = "binary:logistic", 
-                         nrounds = 100L, eval_metric = "auc", nthread = detectCores())
+                         nrounds = 100L, eval_metric = "auc")
 
-params <- makeParamSet(makeDiscreteParam("max_depth", values = 5:20),
-                       makeDiscreteParam("gamma", values = 1:10),
-                       makeDiscreteParam("min_child_weight", values = 1:10),
-                       makeDiscreteParam("eta", values = seq(0.01, 0.30, .01)),
-                       makeDiscreteParam("subsample", values = seq(0.1, 0.5, .1)), 
-                       makeDiscreteParam("colsample_bytree", values = seq(0.1, 0.5, .1)))
+params <- makeParamSet(makeIntegerParam("max_depth", lower = 5L, upper = 20L),
+                       makeIntegerParam("gamma", lower = 1L, upper = 10L),
+                       makeIntegerParam("min_child_weight", lower = 1L, upper = 10L),
+                       makeNumericParam("eta", lower = 0.01, upper = 0.30),
+                       makeNumericParam("subsample", lower = 0.1, upper = 0.5), 
+                       makeNumericParam("colsample_bytree", lower = 0.1, upper = 0.5))
 
 resamp <- makeResampleDesc("CV", stratify = T, iters = 5L)
 tune_control <- makeTuneControlGrid()
