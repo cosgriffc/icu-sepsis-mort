@@ -74,7 +74,8 @@ meetings, and predictive scores have often been derived using logistic regressio
 As the previously sited AUROCs suggest, they all leave room for improvement. The
 goal of this work is to apply modern machine learning techniques to physiologic
 parameters derived from cinical and laboratory data in an effort to build a better
-mortality predictor. 
+mortality predictor; specifically, rather than using SOFA's sequential assessment,
+the goal was to make the prediction using only day from the first day in the ICU.
 
 To accomplish this, the MIMIC-III database was used to develop a cohort of patients
 identified as having sepsis. Sepsis was defined using the ICD-9 codes developed
@@ -933,6 +934,10 @@ The features ultimately selected are shown above. The selected features make a
 great deal of sense: burden of comorbidity and age lead the pack. Our EDA
 demonstrated the importance of these features. It is also noteworthy that 
 ethnicity emerged, as our EDA might have predicted.
+
+The most noteworthy conclusion of this initial work is that only physiological
+data and clinical assessments (Elixhauser, GCS) were kept by the algorithim.
+Laboratory data were not useful, falling below even ethnicity.
 
 
 
