@@ -1,7 +1,9 @@
 ---
 title: "Predicting Sepsis Mortality"
 author: "C.V. Cosgriff"
-output: html_notebook
+output:
+  html_document:
+    df_print: paged
 ---
 
 ```{r warning = FALSE, message = FALSE, echo = FALSE}
@@ -573,6 +575,27 @@ cohort %>% mutate(age_group = age_quantile, gender = ifelse(male_gender == 1, "M
 Overall, the trend holds, with slightly varying slopes between groups. I suspect
 this is secondary to the sample size and is not suggestive of effect modification.
 
+Lastly, lets look at Elixhauser.
+
+```{r}
+groups <- 5
+elix_quantile <- with(cohort, cut(elixhauser, 
+                                breaks = quantile(elixhauser, 
+                                                  probs = seq(0,1, by = (1/groups)), 
+                                                  na.rm=TRUE), 
+                                include.lowest = TRUE))
+
+cohort %>% mutate(elix_group = elix_quantile) %>% group_by(elix_group) %>%
+  summarise(prop_died = mean(hospital_expire_flag)) %>%
+  ggplot() + geom_point(aes(x = elix_group, y = prop_died)) + 
+  xlab("Elixhauser Quintile") + ylab("Proportion Expired") + 
+  geom_text(aes(x = elix_group, y = prop_died+.005, label = round(prop_died, 2))) +
+  ggtitle("Elixhauser Group vs. Proportion Dead") + 
+  geom_smooth(aes(x = elix_group, y = prop_died, group = 1), method = c("lm"))
+```
+
+As we would expect, mortality correlates strongly with Elixhauser.
+
 Before proceeding, we can remove the ethnicity variable we saved at the front
 of the dataset since we will use the dummy coded version going forward.
 
@@ -758,8 +781,8 @@ With that, we are ready to move onto model building.
 
 First, lets make a training set.
 ```{r}
-set.seed(1)
-indices <- createDataPartition(y = cohort$hospital_expire_flag, p = 0.8)$Resample
+set.seed(10)
+indices <- createDataPartition(y = cohort$hospital_expire_flag, p = 0.9)$Resample
 
 train <- cohort %>% dplyr::slice(indices)
 test <- cohort %>% dplyr::slice(-indices)
@@ -821,9 +844,11 @@ Instead, we'll draw 1,000 random samples from the parameter space. We'll optimiz
 gamma, the regularization parameter, as well as the learning rate (eta), subsample,
 sample by tree, our tree depth, and our the minimum child weight.
 
-```{r, cache=TRUE}
+*note: I've set this to eval false for knitting since I recorded the values I obtained when initial coding this*
+*I've done this because runing it takes more than an hour*
+
+```{r, eval = FALSE}
 parallelStartSocket(cpus = detectCores())
-set.seed(23)
 parallelLibrary("mlr")
 traintask <- makeClassifTask (data = train, target = "hospital_expire_flag")
 testtask <- makeClassifTask (data = test, target = "hospital_expire_flag")
@@ -840,35 +865,74 @@ params <- makeParamSet(makeIntegerParam("max_depth", lower = 10L, upper = 15L),
                        makeNumericParam("colsample_bytree", lower = 0.3, upper = 0.5))
 
 resamp <- makeResampleDesc("CV", stratify = T, iters = 5L)
-tune_control <- makeTuneControlRandom(maxit = 100)
+tune_control <- makeTuneControlRandom(maxit = 1000)
 
 tune <- tuneParams(learner = xgb_lrn, task = traintask, resampling = resamp, 
                    measures = acc, par.set = params, control = tune_control, 
                    show.info = T)
 parallelStop()
-```
 
-Now we can fit our model with these hyperparameters.
-
-```{r}
-tuned_lrn <- setHyperPars(xgb_lrn, par.vals = tune$x)
+tuned_lrn <- setHyperPars(xgb_lrn, par.vals = tune$x) # assign the optimal parameters
 mort_gbm2 <- mlr::train(learner = tuned_lrn, task = traintask)
 ```
 
+
+Because the above search is random, and it was tweaked and run multiple times initially,
+re-compilation of this file may result in changes to the output. Becuase I wanted to 
+write up this work, I've manually saved the output I recieved.
+
+The initial output I recieved and carried forward in my analysis is as follows:
+
+max_depth = 10
+gamma = 14
+min_child_weight = 25
+eta = 0.267
+subsample = 0.382
+colsample_bytree = 0.443
+
 ```{r}
-pred <- predict(mort_gbm2, testtask)
-roc <- roc(as.numeric(pred$data$response == 1), as.numeric(pred$data$truth == 1))
+params <- list(booster = "gbtree", objective = "binary:logistic",
+               eta = 0.267, gamma = 14, max_depth = 10, min_child_weight = 25, 
+               subsample = 0.382, colsample_bytree = 0.443)
+```
+
+We have yet to optimize our iteration count, and so finally, we'll use 5-fold
+cross validation to set that.
+
+```{r}
+nround_cv <- xgb.cv(params = params, data = train_xgmat, nrounds = 200, 
+                  nfold = 5, showsd = T, stratified = T, print_every_n = 10,
+                  early_stopping_rounds = 50, maximize = F, metrics = "error")
+```
+
+
+```{r}
+mort_gbm2 <- xgb.train(params = params, data = train_xgmat, nround = nround_cv$best_iteration, 
+                       watchlist = list(train = train_xgmat), 
+                       print_every_n = 10, early_stopping_rounds = 50, 
+                       maximize = T, eval_metric = "auc")
+```
+
+```{r}
+pred <- predict(mort_gbm2, test_xgmat)
+roc <- roc(as.numeric(pred > 0.5), test_label)
 ggroc(roc) + geom_abline(slope = 1, intercept = 1)
 roc$auc
 ```
 
+Our final model achieves an AUROC of 0.7463, just under the AUROC of SOFA.
+It is worth noting that our initial model had an AUC of 0.6912, and so tuning 
+was very useful.
 
 ```{r}
-imp_mat <- xgb.importance(model = mort_gbm2$learner.model)
+imp_mat <- xgb.importance(feature_names = colnames(train_xgmat), model = mort_gbm2)
 xgb.ggplot.importance(imp_mat)
 ```
 
-
+The features ultimately selected are shown above. The selected features make a 
+great deal of sense: burden of comorbidity and age lead the pack. Our EDA
+demonstrated the importance of these features. It is also noteworthy that 
+ethnicity emerged, as our EDA might have predicted.
 
 
 
