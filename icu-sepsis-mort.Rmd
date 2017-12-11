@@ -13,6 +13,10 @@ library(stringr)
 library(reshape2) # Useful for Melt
 library(Hmisc) # overwrites dplyr::summarize but not dplyr::summarise
 
+library(MIMICbook) # Jesse's code for plotting OR; get from GitHub
+library(tableone) # very useful for examining our predictors
+library(pROC) # for ROC evaluation
+
 # ML
 library(caret)
 library(xgboost)
@@ -225,7 +229,6 @@ rrt <- read_csv("./data/rrt.csv")
 uo <- read_csv("./data/uo.csv")
 ```
 
-
 ### Ventilation Status
 ```{r, message = FALSE, warning = FALSE}
 vent <- read_csv("./data/ventfirst.csv")
@@ -247,8 +250,7 @@ gcs <- read_csv("./data/gcs.csv") %>% select(subject_id, hadm_id, icustay_id,
 # Note: Elixhauster is a set of discrete categories for which a point is given;
 # and the sum is the score.
 elix <- read_csv("./data/elixhauser.csv") %>% 
-  mutate(score = rowSums(.[,3:32])) %>% 
-  select(hadm_id, elixhauser = score)
+  select(hadm_id, elixhauser = elixhauser_vanwalraven)
 ```
 
 ### Formation of the Cohort Dataset
@@ -333,10 +335,10 @@ cohort <- cohort %>% mutate(white_eth = ifelse(ethnicity == "WHITE", 1, 0),
                             hispanic_eth = ifelse(ethnicity == "HISPANIC", 1, 0),
                             asian_eth = ifelse(ethnicity == "ASIAN", 1, 0),
                             other_eth = ifelse(ethnicity == "OTHER", 1, 0)) %>%
-  select(-subject_id, -ethnicity) %>%
-  select(hadm_id, hospital_expire_flag, male_gender, white_eth, black_eth,
-         hispanic_eth, asian_eth, other_eth, vent, rrt, elixhauser, mingcs, age,
-         everything())
+  select(-subject_id) %>%
+  select(ethnicity, hadm_id, hospital_expire_flag, male_gender, white_eth, black_eth,  # we keep ethnicity here for EDA,
+         hispanic_eth, asian_eth, other_eth, vent, rrt, elixhauser, mingcs, age,       # but will remove later since dummy coded
+         everything())  
 
 # Note that I used the select statement above to reorder the data. I've grouped
 # variables together to the left of the continuous variables which are together.
@@ -422,62 +424,87 @@ clinically possibility of occuring, we are now ready to explore the data.
 We will begin EDA by asking for simple questions of our data that get to the
 underlying ideas expressed in our `Initial Questions` section.
 
-### 1) What proportion of patients died?
+### 1) What are our cohort demographics?
+
+Sex and Age
+```{r}
+mean(cohort$age)
+mean(cohort$male_gender)
+
+cohort %>% ggplot() + geom_bar(position = "fill", aes(x = 0, fill = as.factor(male_gender))) + 
+  coord_flip() + xlab("") + ylab("Proportion") +
+  theme(axis.title.y = element_blank(), axis.text.y = element_blank(), 
+        axis.ticks.y = element_blank(), 
+        aspect.ratio = .15 ) + 
+  scale_fill_discrete(labels = c("Male", "Female"), name = "Gender") +
+  ggtitle("Gender Proportion")
+```
+
+Ethnicity?
+```{r}
+cohort %>% group_by(ethnicity) %>% summarise(pcount = n()) %>% ungroup() %>%
+  mutate(Proportion = round(pcount / sum(pcount), 2)) %>% select(-pcount, Ethnicity = ethnicity) %>% knitr::kable()
+
+cohort %>% ggplot() + geom_bar(aes(x = as.factor(ethnicity))) + 
+  xlab("Ethnicity") + ggtitle("Ethnicity vs. Death") + 
+  scale_fill_brewer(palette = "Set1", labels = c("Survived", "Expired"), name = "Status")
+```
+
+
+### 2. How many patients died? Does death vary by demography?
 
 ```{r}
 mean(cohort$hospital_expire_flag)
 ```
 
-### 2. Does death vary by demography?
-
 ```{r}
 cohort %>% group_by(male_gender) %>% summarise(prop_died = mean(hospital_expire_flag)) %>%
   ggplot() + geom_col(aes(x = as.factor(male_gender), y = prop_died))
+
+# Better graph for making website
+cohort %>% group_by(male_gender) %>% ggplot() + 
+  geom_bar(position = "fill", aes(x = as.factor(male_gender), fill = as.factor(hospital_expire_flag))) + 
+  coord_flip() + xlab("Gender") + ylab("Proportion") + scale_x_discrete(labels = c("Female", "Male")) +
+  theme(aspect.ratio = .15 ) +
+  ggtitle("Gender vs. Death") + scale_fill_brewer(palette = "Set1", labels = c("Survived", "Expired"), name = "Status")
 ```
 
 There is only a slight gender difference, contrary to many other disease processes
 which often have gender differentials.
 
 ```{r}
-cohort %>% group_by(white_eth) %>% summarise(prop_died = mean(hospital_expire_flag)) %>%
-  ggplot() + geom_col(aes(x = as.factor(white_eth), y = prop_died))
-
-```
-
-Still though, it appears men died slightly less in this cohort.
-
-```{r}
-cohort %>% group_by(black_eth) %>% summarise(prop_died = mean(hospital_expire_flag)) %>%
-  ggplot() + geom_col(aes(x = as.factor(black_eth), y = prop_died))
-```
-
-Compared to all other ethnicities, those identifying as black had a lower 
-proprtion of death.
-
-```{r}
-cohort %>% group_by(hispanic_eth) %>% summarise(prop_died = mean(hospital_expire_flag)) %>%
-  ggplot() + geom_col(aes(x = as.factor(hispanic_eth), y = prop_died))
+cohort %>% ggplot() + geom_bar(aes(x = as.factor(ethnicity), fill = as.factor(hospital_expire_flag))) + 
+  xlab("Ethnicity") + scale_fill_discrete(labels = c("Survived", "Expired"), name = "Status") +
+  ggtitle("Ethnicity vs. Death") + scale_fill_brewer(palette = "Set1", labels = c("Survived", "Expired"), name = "Status")
 ```
 
 Compared to all other ethnicities, those identifying as Hispanic had a lower 
 proprtion of death.
 
-
-```{r}
-cohort %>% group_by(asian_eth) %>% summarise(prop_died = mean(hospital_expire_flag)) %>%
-  ggplot() + geom_col(aes(x = as.factor(asian_eth), y = prop_died))
-```
-
 Asians had a slightly lower proportion than non-Asians.
-
-```{r}
-cohort %>% group_by(other_eth) %>% summarise(prop_died = mean(hospital_expire_flag)) %>%
-  ggplot() + geom_col(aes(x = as.factor(other_eth), y = prop_died))
-```
 
 The binned group "OTHER", which contains those with "unknown" and number of other
 ethncities that were input into MIMIC-III has a larger proprtion of death than
 those identifying as other races.
+
+We can look at the crude odds ratio for ethnicity.
+
+```{r}
+cohort$ethnicity <- as.factor(cohort$ethnicity)
+cohort$ethnicity <- relevel(cohort$ethnicity, ref = "WHITE")
+MIMICbook::plot_OR_by_level(cohort, "ethnicity", "hospital_expire_flag") + ggtitle("OR Death, by Ethncity") +
+  xlab("Ethnicity")
+```
+
+And also , and also stratify on gender.
+
+```{r}
+MIMICbook::plot_OR_by_level(cohort %>% mutate(gender = ifelse(male_gender == 1, "Male", "Female")), "ethnicity", "hospital_expire_flag", factor.var2 = "gender") + ggtitle("OR Death, by Gender and Ethncity") +
+  xlab("Gender") + scale_color_brewer(palette = "Set1", name = "Ethnicity")
+```
+
+Interestingly, the CI suggest we lose significance when we stratify ethnicity
+on gender.
 
 *There are certainly differences by ethnicity.*
 
@@ -493,8 +520,13 @@ age_quantile <- with(cohort, cut(age,
 
 cohort %>% mutate(age_group = age_quantile) %>% group_by(age_group) %>%
   summarise(prop_died = mean(hospital_expire_flag)) %>%
-  ggplot() + geom_point(aes(x = age_group, y = prop_died))
+  ggplot() + geom_point(aes(x = age_group, y = prop_died)) + 
+  xlab("Age Quintile") + ylab("Proportion Expired") + 
+  geom_text(aes(x = age_group, y = prop_died+.005, label = round(prop_died, 2))) +
+  ggtitle("Age Group vs. Proportion Dead") + 
+  geom_smooth(aes(x = age_group, y = prop_died, group = 1), method = c("lm"))
 ```
+
 
 There appears to be a linear relationship between age group and proportion dying,
 as we would expect. We can repeat this graph and split by gender to see if we
@@ -503,11 +535,50 @@ would expect an interaction.
 ```{r}
 cohort %>% mutate(age_group = age_quantile) %>% group_by(age_group, male_gender) %>%
   summarise(prop_died = mean(hospital_expire_flag)) %>%
-  ggplot() + geom_point(aes(x = age_group, y = prop_died, color = as.factor(male_gender)))
+  ggplot() + geom_point(aes(x = age_group, y = prop_died, color = as.factor(male_gender))) + 
+  xlab("Age Quintile") + ylab("Proportion Expired") + 
+  geom_text(aes(x = age_group, y = prop_died+.005, label = round(prop_died, 2))) +
+  ggtitle("Age Group vs. Proportion Dead, Examining Gender Interaction") + 
+  scale_color_discrete(labels = c("Male", "Female"), name = "Gender") + 
+  geom_smooth(aes(x = age_group, y = prop_died, group = male_gender), method = c("lm"))
 ```
 
 The linear relationship holds, and the lines look fairly parallel suggesting
 interaction is likely not present and doesn't need to be explored.
+
+We can also look at this by ethnicity, and ethnicity stratified by
+gender.
+
+```{r, echo = FALSE}
+cohort %>% mutate(age_group = age_quantile) %>% group_by(age_group, ethnicity) %>%
+  summarise(prop_died = mean(hospital_expire_flag)) %>%
+  ggplot() + geom_point(aes(x = age_group, y = prop_died)) + 
+  xlab("Age Quintile") + ylab("Proportion Expired") + 
+  ggtitle("Age Group vs. Proportion Dead, Stratified by Ethncity") + 
+  scale_color_discrete(labels = c("Male", "Female"), name = "Gender") + 
+  facet_wrap(~ethnicity) + geom_smooth(aes(x = age_group, y = prop_died, group = 1), method = c("lm")) + 
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+cohort %>% mutate(age_group = age_quantile, gender = ifelse(male_gender == 1, "Male", "Female")) %>% 
+  group_by(age_group, ethnicity, gender) %>%
+  summarise(prop_died = mean(hospital_expire_flag)) %>%
+  ggplot() + geom_point(aes(x = age_group, y = prop_died)) + 
+  xlab("Age Quintile") + ylab("Proportion Expired") + 
+  ggtitle("Age Group vs. Proportion Dead, Stratified by Gender and Ethnicity") + 
+  scale_color_discrete(labels = c("Male", "Female"), name = "Gender") + 
+  facet_grid(gender~ethnicity) + geom_smooth(aes(x = age_group, y = prop_died, 
+                                                      group = 1), method = c("lm")) +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+```
+
+Overall, the trend holds, with slightly varying slopes between groups. I suspect
+this is secondary to the sample size and is not suggestive of effect modification.
+
+Before proceeding, we can remove the ethnicity variable we saved at the front
+of the dataset since we will use the dummy coded version going forward.
+
+```{r}
+cohort <- cohort %>% select(-ethnicity)
+```
 
 
 ### 3. How are the variables associated with outcome?
@@ -534,63 +605,18 @@ it will be appropriate because of the shape of the distribution, but where it
 is not, we can justify such tests by the number of patients in our cohort in
 reliance of the central limit theorem (CLT).
 
-We'll now perform univarate tests of association for the continuous variables.
+We can very eaily examine the association between the exposure and outcome using
+the package Table 1, and stratifying by the outcome.
 
 ```{r}
-cont_var <- colnames(cohort %>% select(-hadm_id, -hospital_expire_flag, -male_gender, -white_eth, -black_eth, 
-                                        -hispanic_eth, -asian_eth, -other_eth, 
-                                        -vent, -rrt))
-uv_result <- data.frame()
-for (i in cont_var) {
-  uv_result <- rbind(uv_result, 
-                     data.frame(var = i, p = with(cohort, t.test(get(i) ~ as.factor(hospital_expire_flag))$p.value)))
-}
+CreateTableOne(vars = colnames(cohort %>% select(-hadm_id, -hospital_expire_flag)),
+               data = cohort, strata = "hospital_expire_flag")
 ```
 
 With each association calculated, we can see which variables were signicantly
-associated at an alpha cutoff of <0.05.
-
-```{r}
-uv_result %>% filter(p < 0.05)
-```
-
-59 of the 66 continuous variables are associated with hospital death.
-
-```{r}
-uv_result %>% filter(p > 0.05)
-```
-
-These 7 variables above are not.
-
-We can carry out the same procedure for the binary variables using Fisher's
-exact test.
-
-```{r}
-bin_var <- colnames(cohort %>% select(male_gender, white_eth, -black_eth, 
-                                        hispanic_eth, asian_eth, other_eth, 
-                                        vent, rrt))
-uv_result <- data.frame()
-for (i in bin_var) {
-  uv_result <- rbind(uv_result, 
-                     data.frame(var = i, p = with(cohort, fisher.test(table(get(i), as.factor(hospital_expire_flag)))$p.value)))
-}
-```
-
-And now we can ask which are significant at a 0.05 cut off.
-
-```{r}
-uv_result %>% filter(p < 0.05)
-```
-
-```{r}
-uv_result %>% filter(p > 0.05)
-```
-
-As we can see, vent and rrt are associated, and some, but not all of the race
-categories are associated. Male gender was not associated.
-
-
-
+associated at an alpha cutoff of <0.05. 59 of the 66 continuous variables are 
+associated with hospital death. As we can see, vent and rrt are associated, and some, 
+but not all of the race categories are associated. Male gender was not associated.
 
 ### 4. Is there an underlying structure to the data?
 
@@ -604,6 +630,9 @@ Note: we'll use some simple string detection to try and avoid things that are
 obviously correlated like heartrate_max and heartrate_mean.
 
 ```{r}
+cont_var <- colnames(cohort %>% select(-hadm_id, -hospital_expire_flag, -male_gender, -white_eth, -black_eth, 
+-hispanic_eth, -asian_eth, -other_eth, 
+-vent, -rrt))
 correlations <- rcorr(as.matrix(cohort[, cont_var]))
 m <- length(cont_var)
 for (i in 1:m) {
@@ -659,7 +688,7 @@ Looking at the first 4 PCs we see that while there appears to be some group
 separation, the groups that separate off are quite small. As this PCA was 
 performed to explore the data and not to specifically improve model buidling,
 and since the discriminatory effect appears minimal, this approach won't be
-developed further at this time.
+developed further.
 
 In our EDA we've learned the following:
 1) Demographic factors seem to matter for hospital mortality.
@@ -729,7 +758,7 @@ With that, we are ready to move onto model building.
 
 First, lets make a training set.
 ```{r}
-set.seed(23)
+set.seed(1)
 indices <- createDataPartition(y = cohort$hospital_expire_flag, p = 0.8)$Resample
 
 train <- cohort %>% dplyr::slice(indices)
@@ -754,29 +783,15 @@ We begin by setting starting paramters. These starting points were chosen based
 on prior work and reading.
 
 ```{r}
-params <- list(booster = "gbtree", objective = "binary:logistic", 
-               eta = 0.15, gamma = 0, max_depth = 15, min_child_weight = 1, 
-               subsample = 0.5, colsample_bytree = 0.5, seed = 23)
+params <- list(booster = "gbtree", objective = "binary:logistic",
+               eta = 0.3, gamma = 0, max_depth = 10, min_child_weight = 3, 
+               subsample = 0.5, colsample_bytree = 0.5)
 ```
 
-And now we can use CV to determine the ideal number of iterations. We'll use 5
-fold cross validation.
+Using these baseline parameters we'll build our first mode.
 
 ```{r}
-nround_cv <- xgb.cv(params = params, data = train_xgmat, nrounds = 100, 
-                    nfold = 5, showsd = T, stratified = T, print_every_n = 10, 
-                    early_stopping_rounds = 50, maximize = T, metrics = "auc")
-```
-
-In addition to obtaining the right number of iterations, we also see something
-quite important here: the training AUC and testing AUC are quite different, and
-our model may be overfit overfit when we train it. We will not include a gamma
-to regularlize for this first model, but will certainly have to examine gamma
-during model tuning.
-
-```{r}
-mort_gbm1 <- xgb.train(params = params, data = train_xgmat, 
-                       nrounds = nround_cv$best_iteration, 
+mort_gbm1 <- xgb.train(params = params, data = train_xgmat, nround = 100, 
                        watchlist = list(train = train_xgmat), 
                        print_every_n = 10, early_stopping_rounds = 50, 
                        maximize = T, eval_metric = "auc")
@@ -784,43 +799,48 @@ mort_gbm1 <- xgb.train(params = params, data = train_xgmat,
 
 We now evaluate this first model.
 
-
 ```{r}
 pred <- predict(mort_gbm1, test_xgmat)
-# Because pred is probability, we will use a cutoff of 0.5 and convert these to 
-# actual predicted outcomes. 
-pred <- ifelse(pred > 0.5, 1, 0)
-
-confusionMatrix(pred, test_label, positive = "1")
+roc_gbm1 <- roc(as.numeric(pred > 0.5), test_label)
+roc_gbm1$auc
+ggroc(roc_gbm1) + geom_abline(slope = 1, intercept = 1)
+confusionMatrix(as.numeric(pred > 0.5), test_label)
 ```
 
 This first model is rather specific, but poorly sensitive. This follows logically
 given the prevalence of death in the cohort. However, we saw that the training
 AUC was quite good; we can introduce regularization to help with this issue. 
 
-Now we'll perform a grid search through the parameter space. The ranges for the
-search were chosen after consulting the XGBoost manual and forums for typical
-values.
+While a grid search of the parameter space is the oft recommended approach to 
+hyperparameter tuning, it is rather inefficent. In addition to the computational
+burden, it has been suggested in the literature that it doesn't make sense given
+that most hyperparameters "do not matter much." Bergstra and Benigo describe this
+in the [Journal of Machine Learning](http://jmlr.csail.mit.edu/papers/volume13/bergstra12a/bergstra12a.pdf). 
 
-```{r}
+Instead, we'll draw 1,000 random samples from the parameter space. We'll optimize
+gamma, the regularization parameter, as well as the learning rate (eta), subsample,
+sample by tree, our tree depth, and our the minimum child weight.
+
+```{r, cache=TRUE}
 parallelStartSocket(cpus = detectCores())
+set.seed(23)
 parallelLibrary("mlr")
 traintask <- makeClassifTask (data = train, target = "hospital_expire_flag")
 testtask <- makeClassifTask (data = test, target = "hospital_expire_flag")
 
 xgb_lrn <- makeLearner("classif.xgboost", predict.type = "response")
 xgb_lrn$par.vals <- list(booster = "gbtree", objective = "binary:logistic", 
-                         nrounds = 100L, eval_metric = "auc")
+                         nrounds = 50L, eval_metric = "auc")
 
-params <- makeParamSet(makeIntegerParam("max_depth", lower = 5L, upper = 20L),
-                       makeIntegerParam("gamma", lower = 1L, upper = 10L),
-                       makeIntegerParam("min_child_weight", lower = 1L, upper = 10L),
-                       makeNumericParam("eta", lower = 0.01, upper = 0.30),
-                       makeNumericParam("subsample", lower = 0.1, upper = 0.5), 
-                       makeNumericParam("colsample_bytree", lower = 0.1, upper = 0.5))
+params <- makeParamSet(makeIntegerParam("max_depth", lower = 10L, upper = 15L),
+                       makeIntegerParam("gamma", lower = 10L, upper = 20L),
+                       makeIntegerParam("min_child_weight", lower = 15L, upper = 25L),
+                       makeNumericParam("eta", lower = 0.2, upper = 0.3),
+                       makeNumericParam("subsample", lower = 0.3, upper = 0.5), 
+                       makeNumericParam("colsample_bytree", lower = 0.3, upper = 0.5))
 
 resamp <- makeResampleDesc("CV", stratify = T, iters = 5L)
-tune_control <- makeTuneControlGrid()
+tune_control <- makeTuneControlRandom(maxit = 100)
 
 tune <- tuneParams(learner = xgb_lrn, task = traintask, resampling = resamp, 
                    measures = acc, par.set = params, control = tune_control, 
@@ -828,20 +848,23 @@ tune <- tuneParams(learner = xgb_lrn, task = traintask, resampling = resamp,
 parallelStop()
 ```
 
-Now we can fit our model with these parameters.
+Now we can fit our model with these hyperparameters.
 
 ```{r}
 tuned_lrn <- setHyperPars(xgb_lrn, par.vals = tune$x)
 mort_gbm2 <- mlr::train(learner = tuned_lrn, task = traintask)
+```
+
+```{r}
 pred <- predict(mort_gbm2, testtask)
-confusionMatrix(pred$data$response, pred$data$truth, positive = "1")
+roc <- roc(as.numeric(pred$data$response == 1), as.numeric(pred$data$truth == 1))
+ggroc(roc) + geom_abline(slope = 1, intercept = 1)
+roc$auc
 ```
 
 
-
-# for later
-```{r fig.height=5, fig.width=5}
-imp_mat <- xgb.importance(feature_names = colnames(train_mat), model = mort_gbm1)
+```{r}
+imp_mat <- xgb.importance(model = mort_gbm2$learner.model)
 xgb.ggplot.importance(imp_mat)
 ```
 
